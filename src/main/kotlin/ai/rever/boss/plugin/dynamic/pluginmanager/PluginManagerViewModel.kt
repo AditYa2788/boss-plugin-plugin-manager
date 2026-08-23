@@ -5,7 +5,7 @@ import ai.rever.boss.plugin.api.CustomPluginEvent
 import ai.rever.boss.plugin.api.InaccessiblePluginInfo
 import ai.rever.boss.plugin.api.McpServerController
 import ai.rever.boss.plugin.api.SupabaseDataProvider
-import ai.rever.boss.plugin.dynamic.pluginmanager.impl.OrganisationCta
+import ai.rever.boss.plugin.dynamic.pluginmanager.impl.OrgAccess
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.canPublishAnywhereWith
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.orgPublishTargets
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.PluginPageUrl
@@ -17,7 +17,7 @@ import ai.rever.boss.plugin.dynamic.pluginmanager.impl.panelHostTabInfo
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.panelLaunchRoute
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.resolveLaunchSurface
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.supportsOpenPanelAsTab
-import ai.rever.boss.plugin.dynamic.pluginmanager.impl.organisationCta
+import ai.rever.boss.plugin.dynamic.pluginmanager.impl.orgAccessRoute
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.Membership
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.PublishTarget
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.parsePublishTargets
@@ -108,10 +108,11 @@ data class PluginManagerState(
     /**
      * The signed-in user's organisation membership.
      *
-     * NULL while the lookup is in flight, or when there is no Supabase provider
-     * to ask. Null renders no call to action at all -- see [organisationCta].
-     * A Boolean defaulting to false would show "Request an organisation" to
-     * every existing member for the length of a round trip.
+     * NULL while the lookup is in flight, or when there is no Supabase provider to ask -- the
+     * two are told apart by `organisationServiceAvailable`. Null renders the section's "checking"
+     * state, never an assertion about what they belong to: see [orgRequestState]. A Boolean
+     * defaulting to false would tell every existing member they are in no organisation for the
+     * length of a round trip.
      */
     val membership: Membership? = null,
     /**
@@ -119,9 +120,17 @@ data class PluginManagerState(
      *
      * A SEPARATE read from membership: submit_organisation_request writes to
      * organisation_requests and creates no membership row, so refreshing membership alone could
-     * never move the call to action off CREATE.
+     * never move the request control off "Request an organisation".
      */
     val hasPendingOrgRequest: Boolean = false,
+    /**
+     * Whether an organisation read has completed at least once, whatever it said.
+     *
+     * Separates "still waiting" from "asked and learned nothing": both leave [membership] null,
+     * and only the first is worth showing a spinner for. Without it a failed read renders
+     * "Checking your organisations..." with a disabled button forever - see [orgRequestState].
+     */
+    val organisationReadCompleted: Boolean = false,
     /** True while the "request an organisation" dialog is open. */
     val organisationRequestOpen: Boolean = false,
     /** True while a request is in flight, so the dialog can disable its submit. */
@@ -243,12 +252,39 @@ class PluginManagerViewModel(
     /** Opens a tab in the main area, for the tab-type branch of [openPlugin]. */
     private val splitViewOperations: SplitViewOperations? = null,
     /**
-     * Read-only Supabase access, for the one question the Toolbox asks about
-     * organisations: does this user belong to any. Null when Supabase is
-     * unavailable, which leaves the call to action hidden rather than wrong.
+     * Read-only Supabase access, for the two questions the Toolbox asks about organisations: does
+     * this user belong to any, and do they have a request in the queue. Null when Supabase is
+     * unavailable, which is reported as [organisationServiceAvailable] rather than left to look
+     * like a read that has not come back yet.
      */
     private val supabaseDataProvider: SupabaseDataProvider? = null
 ) {
+    /**
+     * Whether organisation reads and the request submission can happen at all in this host.
+     *
+     * Constant for the life of the ViewModel, so it is a plain val rather than a state field: a
+     * default in the state class would be a lie for one frame in whichever direction it defaulted.
+     * Without it, "no provider" and "the read has not answered yet" are the same nullable
+     * membership, and the second resolves while the first never does - so the section would say
+     * "Checking your organisations..." forever.
+     */
+    val organisationServiceAvailable: Boolean = supabaseDataProvider != null
+
+    /**
+     * Which organisation read is the current one.
+     *
+     * `_state.update` stops a stale snapshot clobbering a field; it does NOT stop an older
+     * RESPONSE landing after a newer one and writing what it read. Three call sites can have
+     * reads in flight at once (`refresh`, the header button, the tail of
+     * `submitOrganisationRequest`), and the damaging order is reachable: a manual refresh whose
+     * empty request-queue answer lands AFTER a submission would clear the optimistic
+     * `hasPendingOrgRequest` and re-offer the button, which is the duplicate submission that
+     * PENDING exists to prevent.
+     *
+     * Atomic because the three call sites are not on one thread.
+     */
+    private val organisationReadGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     // Child scope of the plugin scope: cancelled in dispose() so collectors of a
     // closed panel don't leak, while plugin unload still cancels everything.
     private val scope = CoroutineScope(
@@ -284,7 +320,12 @@ class PluginManagerViewModel(
                         isIncompatible = plugin.isIncompatible
                     )
                 }
-                _state.value = _state.value.copy(installedPlugins = installedStates)
+                // update, NOT `_state.value = _state.value.copy(...)`: this races
+                // refreshOrganisationMembership, and a plain read-modify-write here reset
+                // `membership` to null from a stale snapshot - which took the whole organisation
+                // section, and formerly the Create tab itself, off screen until the next refresh
+                // happened to interleave the other way.
+                _state.update { it.copy(installedPlugins = installedStates) }
                 recomputeOpenablePlugins(installedStates)
             }
         }
@@ -366,9 +407,11 @@ class PluginManagerViewModel(
         scope.launch {
             runCatching {
                 roleManagementProvider?.getAllPermissions()?.getOrNull()?.let { perms ->
-                    _state.value = _state.value.copy(
-                        permissionDescriptions = perms.associate { it.name to (it.description ?: "") }
-                    )
+                    _state.update {
+                        it.copy(
+                            permissionDescriptions = perms.associate { it.name to (it.description ?: "") },
+                        )
+                    }
                 }
             }
         }
@@ -378,7 +421,7 @@ class PluginManagerViewModel(
      * Select a tab.
      */
     fun selectTab(tab: PluginManagerTab) {
-        _state.value = _state.value.copy(currentTab = tab)
+        _state.update { it.copy(currentTab = tab) }
         // Auto-refresh store when switching to Available tab
         if (tab == PluginManagerTab.AVAILABLE) {
             refreshStore()
@@ -389,7 +432,7 @@ class PluginManagerViewModel(
      * Update search query.
      */
     fun setSearchQuery(query: String) {
-        _state.value = _state.value.copy(searchQuery = query)
+        _state.update { it.copy(searchQuery = query) }
     }
 
     /**
@@ -693,10 +736,12 @@ class PluginManagerViewModel(
             return
         }
 
-        _state.value = _state.value.copy(
-            error = failure?.let { "Could not open $name: $it" }
-                ?: "$name has no panel or tab to open."
-        )
+        _state.update {
+            it.copy(
+                error = failure?.let { "Could not open $name: $it" }
+                ?: "$name has no panel or tab to open.",
+            )
+        }
     }
 
     /** The registered panel this plugin's Open action targets, or null. */
@@ -750,7 +795,9 @@ class PluginManagerViewModel(
             }
         }.getOrDefault(emptySet())
         if (openable != _state.value.openablePlugins) {
-            _state.value = _state.value.copy(openablePlugins = openable)
+            // update for the same reason as the installed-plugins write above: registry changes
+            // land concurrently with the membership read.
+            _state.update { it.copy(openablePlugins = openable) }
         }
     }
 
@@ -759,60 +806,91 @@ class PluginManagerViewModel(
         _state.value.installedPlugins.find { it.pluginId == pluginId }?.displayName ?: pluginId
 
     /**
-     * Load whether the user belongs to any organisation.
+     * Load whether the user belongs to any organisation, and whether they have a request pending.
      *
-     * Best effort and deliberately quiet: any failure leaves `hasOrganisation`
-     * null, which hides the call to action. Showing "Request an organisation"
-     * because a read failed would push somebody toward creating a duplicate of
-     * one they are already in.
+     * Best effort and deliberately quiet: any failure leaves `membership` null, which shows the
+     * section in its "checking" state rather than asserting anything. Claiming "you are not a
+     * member of any organisation" because a read failed would be a sentence the reader can see is
+     * wrong.
      */
     fun refreshOrganisationMembership() {
         val supabase = supabaseDataProvider ?: return
+        val generation = organisationReadGeneration.incrementAndGet()
         scope.launch {
-            // runCatching, because rpc() can THROW rather than return a failed Result
-            // (serialization, cancellation, a transport that does not wrap). The KDoc above
-            // promises this is quiet; without the catch it takes the coroutine down instead.
-            val raw =
-                runCatching { supabase.rpc("get_my_organisations", "{}").getOrNull() }.getOrNull()
+            // CONCURRENT, not sequential. The two reads are independent, and awaiting them in
+            // turn put a second full round trip in front of `membership` and `publishTargets`
+            // for every user on every refresh - including publishers, who will never request an
+            // organisation but whose publish picker waits on `publishTargets`. Cost is now the
+            // slower of the two rather than their sum.
+            //
+            // runCatching around each, because rpc() can THROW rather than return a failed
+            // Result (serialization, cancellation, a transport that does not wrap). The KDoc
+            // above promises this is quiet; without the catch it takes the coroutine down.
+            val (raw, requests) = coroutineScope {
+                val orgs = async {
+                    runCatching {
+                        supabase.rpc("get_my_organisations", "{}").getOrNull()
+                    }.getOrNull()
+                }
+                // Asked UNCONDITIONALLY. It used to be skipped for a member, on the grounds that
+                // a member could not reach the request branch anyway - and once they can,
+                // skipping it means a member who has already submitted a request is offered the
+                // button again and gets "already in use" for their trouble.
+                //
+                // A reviewer holding organisation.approve gets the WHOLE queue here and
+                // parsePendingRequest discards it, so this is a payload that grows with the
+                // queue for them. Acceptable: the RPC is already theirs to call and the read is
+                // off the critical path now. TODO: pass a caller-scoped flag if the server ever
+                // grows one.
+                val pendingQueue = async {
+                    runCatching {
+                        supabase.rpc(
+                            "list_organisation_requests",
+                            """{"p_status":"pending"}""",
+                        ).getOrNull()
+                    }.getOrNull()
+                }
+                orgs.await() to pendingQueue.await()
+            }
+
             val membership = parseMembership(raw)
             // Same response, second question. get_my_organisations already projects can_publish
             // per row, so the publish picker costs no extra round trip - and cannot disagree with
             // the membership shown beside it, since both are read from one answer.
             val targets = parsePublishTargets(raw)
+            val pending = parsePendingRequest(requests)
 
-            // Only asked when it can change the answer. A member already gets
-            // INSTALL_PLUGIN or OPEN, so the extra round trip would buy nothing.
-            val pending =
-                if (membership == Membership.NONE) {
-                    val requests =
-                        runCatching {
-                            supabase.rpc(
-                                "list_organisation_requests",
-                                """{"p_status":"pending"}""",
-                            ).getOrNull()
-                        }.getOrNull()
-                    parsePendingRequest(requests)
-                } else {
-                    // A member has no CREATE branch to reach, so the queue read is skipped -
-                    // null, not false, because we did not ask.
-                    null
-                }
-
-            _state.value =
-                _state.value.copy(
-                    membership = membership,
+            // update, and the CAS retry is the point: everything the panel-open path writes
+            // lands concurrently with this, and a plain read-modify-write in either direction
+            // discards whatever the other one had just published. `it` inside the block is the
+            // freshly-read snapshot on every attempt, so retainPendingRequest compares against
+            // the value that actually won.
+            _state.update {
+                // The staleness check lives INSIDE the CAS. Outside it, a submission landing
+                // between the check and the write bumped the generation too late to be seen, and
+                // this older read still published - clearing the optimistic hasPendingOrgRequest
+                // and re-offering the button. Here the window is the CAS itself.
+                if (organisationReadGeneration.get() != generation) return@update it
+                it.copy(
+                    // Retained on an inconclusive read rather than written over. parseMembership
+                    // returns null for a transport failure the same as for a refusal, so writing
+                    // it unconditionally let one blip take a member from ACTIVE to "we don't
+                    // know" - dropping their Open Organisation button. Same "unknown is not no"
+                    // rule as retainPendingRequest.
+                    membership = membership ?: it.membership,
                     publishTargets = targets,
-                    // Never downgraded by a refresh - see retainPendingRequest for why a
-                    // server `false` is not evidence of absence.
-                    hasPendingOrgRequest =
-                        retainPendingRequest(_state.value.hasPendingOrgRequest, pending),
+                    organisationReadCompleted = true,
+                    // Retained only when the read was INCONCLUSIVE. A confident `false` DOES
+                    // clear it, deliberately - see retainPendingRequest, which explains why the
+                    // monotonic version of this locked a user out after a rejection.
+                    hasPendingOrgRequest = retainPendingRequest(it.hasPendingOrgRequest, pending),
                 )
+            }
         }
     }
 
     fun dismissOrganisationRequest() {
-        _state.value =
-            _state.value.copy(organisationRequestOpen = false, organisationRequestError = null)
+        _state.update { it.copy(organisationRequestOpen = false, organisationRequestError = null) }
     }
 
     /**
@@ -833,7 +911,7 @@ class PluginManagerViewModel(
         website: String,
     ) {
         val supabase = supabaseDataProvider ?: return
-        _state.value = _state.value.copy(organisationRequestBusy = true, organisationRequestError = null)
+        _state.update { it.copy(organisationRequestBusy = true, organisationRequestError = null) }
 
         scope.launch {
             // Wrapped, because everything that clears `busy` lives on the success and failure
@@ -856,39 +934,42 @@ class PluginManagerViewModel(
                 val error = submitRequestError(raw)
 
                 if (error != null) {
-                    _state.value =
-                        _state.value.copy(
+                    _state.update {
+                        it.copy(
                             organisationRequestBusy = false,
                             organisationRequestError = error,
                         )
+                    }
                     return@launch
                 }
 
-                _state.value =
-                    _state.value.copy(
+                _state.update {
+                    it.copy(
                         organisationRequestBusy = false,
                         organisationRequestOpen = false,
                         organisationRequestError = null,
-                        // Optimistic, and it closes a real window: without it the CTA stays
-                        // CREATE and enabled for the length of the refresh below, so the user
+                        // Optimistic, and it closes a real window: without it the request stays
+                        // AVAILABLE and enabled for the length of the refresh below, so the user
                         // can reopen the dialog and submit again - and the second attempt
                         // returns the "already exists" refusal this state exists to prevent.
                         hasPendingOrgRequest = true,
                     )
-                // The request is pending, not approved. Refreshing is what turns the call to
-                // action into "Request pending review"; without it the button is byte-for-byte
-                // unchanged after a submission and the natural response is to submit again.
+                }
+                // The request is pending, not approved. Refreshing is what turns the control into
+                // "Request pending review"; without it the button is byte-for-byte unchanged
+                // after a submission and the natural response is to submit again.
                 refreshOrganisationMembership()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Must propagate, or a cancelled scope leaks this coroutine.
-                _state.value = _state.value.copy(organisationRequestBusy = false)
+                _state.update { it.copy(organisationRequestBusy = false) }
                 throw e
             } catch (_: Throwable) {
-                _state.value =
-                    _state.value.copy(
+                _state.update {
+                    it.copy(
                         organisationRequestBusy = false,
                         organisationRequestError = "Could not send the request. Please try again.",
                     )
+                }
             }
         }
     }
@@ -898,32 +979,36 @@ class PluginManagerViewModel(
         _state.value.installedPlugins.any { it.pluginId == OrganisationPlugin.PLUGIN_ID }
 
     /**
-     * The Toolbox call to action: request one, install the plugin, or open it.
+     * Open the request-an-organisation form.
      *
-     * Mirrors openToolCreator, including the install branch -- there is no point
-     * opening a panel that does not exist yet.
+     * In-app, NOT a web page. `submit_organisation_request` is authenticated-only, and the
+     * handoff-token mechanism that authenticates the other organisation web pages is org-scoped -
+     * a user with no organisation has nothing to hand off for, so a web form could not
+     * authenticate at all.
+     *
+     * Gated on nothing but the provider. The button that calls this is already disabled in every
+     * state that has nothing to do ([orgRequestEnabled]), and re-deriving that here would be a
+     * second copy of the rule for a control the user cannot press.
      */
-    fun onOrganisationCta() {
-        when (organisationCta(
-                _state.value.membership,
-                isOrganisationPluginInstalled(),
-                _state.value.hasPendingOrgRequest,
-            )) {
-            OrganisationCta.CREATE ->
-                // In-app, NOT a web page. submit_organisation_request is
-                // authenticated-only, and the handoff-token mechanism that
-                // authenticates the other web pages is org-scoped - a user with
-                // no organisation has nothing to hand off for, so a web form
-                // could not authenticate at all.
-                _state.value = _state.value.copy(
-                    organisationRequestOpen = true,
-                    organisationRequestError = null,
-                )
+    fun onRequestOrganisation() {
+        if (!organisationServiceAvailable) return
+        _state.update {
+            it.copy(organisationRequestOpen = true, organisationRequestError = null)
+        }
+    }
 
-            OrganisationCta.INSTALL_PLUGIN ->
+    /**
+     * Take the member route into the Organisation plugin: install it, or open its panel.
+     *
+     * Mirrors openToolCreator, including the install branch -- there is no point opening a panel
+     * that does not exist yet.
+     */
+    fun onOrganisationAccess() {
+        when (orgAccessRoute(_state.value.membership, isOrganisationPluginInstalled())) {
+            OrgAccess.INSTALL_PLUGIN ->
                 installFromRemote(OrganisationPlugin.PLUGIN_ID)
 
-            OrganisationCta.OPEN -> {
+            OrgAccess.OPEN -> {
                 val wid = windowId
                 // openPanel is suspend, so it needs a scope -- same shape as
                 // openToolCreator.
@@ -946,14 +1031,14 @@ class PluginManagerViewModel(
                 }
             }
 
-            // A pending request has nothing to act on; the button is disabled anyway.
-            OrganisationCta.REQUEST_PENDING, null -> Unit
+            // Not a member, or not known yet: no access button was rendered to reach this.
+            null -> Unit
         }
     }
 
     fun installFromRemote(pluginId: String) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
 
             // Friendly name for the status-bar progress item (the API only gets the id).
             _state.value.availablePlugins.find { it.pluginId == pluginId }?.displayName
@@ -964,17 +1049,19 @@ class PluginManagerViewModel(
                 is InstallResult.Success -> {
                     apiImpl.refreshInstalledPlugins()
                     refreshStoreInternal()
-                    _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins - pluginId)
+                    _state.update { it.copy(busyPlugins = it.busyPlugins - pluginId) }
                 }
                 // The four failure-ish variants share one decision with every other button.
                 // They used to be spelled out here with their own wording, which is how the
                 // busiest Install button in the app came to disagree with the canonical
                 // answer about what AlreadyInstalled means.
                 else -> {
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = outcomeErrorFor(result, PluginAction.INSTALL)
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = outcomeErrorFor(result, PluginAction.INSTALL),
+                        )
+                    }
                 }
             }
         }
@@ -987,9 +1074,11 @@ class PluginManagerViewModel(
      */
     fun installFromFilePicker() {
         // File picker not available in dynamic plugin context
-        _state.value = _state.value.copy(
-            error = "File picker not available. Use GitHub URL instead."
-        )
+        _state.update {
+            it.copy(
+                error = "File picker not available. Use GitHub URL instead.",
+            )
+        }
     }
 
     /**
@@ -997,14 +1086,14 @@ class PluginManagerViewModel(
      */
     fun installFromGitHub(githubUrl: String) {
         scope.launch {
-            _state.value = _state.value.copy(isLoading = true, error = null)
+            _state.update { it.copy(isLoading = true, error = null) }
 
             val result = api.installFromGitHub(githubUrl)
             when (result) {
                 is InstallResult.Success -> {
                     // Refresh installed plugins after successful install
                     apiImpl.refreshInstalledPlugins()
-                    _state.value = _state.value.copy(isLoading = false)
+                    _state.update { it.copy(isLoading = false) }
                 }
                 // One decision point for every non-Success outcome. The bespoke "Download
                 // failed" / "Load failed" prefixes that used to sit here lost nothing worth
@@ -1012,10 +1101,12 @@ class PluginManagerViewModel(
                 // this `when` had its own idea of which variants matter, which is how
                 // VersionConflict came to say nothing at all.
                 else -> {
-                    _state.value = _state.value.copy(
-                        isLoading = false,
-                        error = outcomeErrorFor(result, PluginAction.INSTALL)
-                    )
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = outcomeErrorFor(result, PluginAction.INSTALL),
+                        )
+                    }
                 }
             }
         }
@@ -1026,30 +1117,36 @@ class PluginManagerViewModel(
      */
     fun uninstallPlugin(pluginId: String) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
 
             val result = api.uninstallPlugin(pluginId)
             when (result) {
                 is UninstallResult.Success -> {
-                    _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins - pluginId)
+                    _state.update { it.copy(busyPlugins = it.busyPlugins - pluginId) }
                 }
                 is UninstallResult.NotFound -> {
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = "Plugin not found: ${result.pluginId}"
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = "Plugin not found: ${result.pluginId}",
+                        )
+                    }
                 }
                 is UninstallResult.CannotUnload -> {
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = "Cannot uninstall: ${result.reason}"
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = "Cannot uninstall: ${result.reason}",
+                        )
+                    }
                 }
                 is UninstallResult.Failed -> {
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = "Uninstall failed: ${result.error}"
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = "Uninstall failed: ${result.error}",
+                        )
+                    }
                 }
             }
         }
@@ -1060,23 +1157,34 @@ class PluginManagerViewModel(
      */
     fun updatePlugin(pluginId: String) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
 
             val result = api.updatePlugin(pluginId)
             when (result) {
                 is InstallResult.Success -> {
-                    val newUpdates = _state.value.updates.filter { it.pluginId != pluginId }
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        updates = newUpdates,
-                        postUpdatePrompt = buildPostUpdatePrompt(listOf(pluginId))
-                    )
+                    // Hoisted: buildPostUpdatePrompt RELOADS plugins, and an update block re-runs
+                    // whenever the CAS loses a race - which would reload them twice.
+                    val prompt = buildPostUpdatePrompt(listOf(pluginId))
+                    // `updates` is filtered INSIDE the block, from the snapshot the CAS is about
+                    // to write against. Snapshotting it before the suspending call above and
+                    // writing that back discarded anything checkForUpdatesInternal published in
+                    // between - the same stale-write-back shape as the membership reset, on a
+                    // different field. `s` is named because `it` is taken by the inner filter.
+                    _state.update { s ->
+                        s.copy(
+                            busyPlugins = s.busyPlugins - pluginId,
+                            updates = s.updates.filter { it.pluginId != pluginId },
+                            postUpdatePrompt = prompt,
+                        )
+                    }
                 }
                 else -> {
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = outcomeErrorFor(result, PluginAction.UPDATE)
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = outcomeErrorFor(result, PluginAction.UPDATE),
+                        )
+                    }
                 }
             }
         }
@@ -1087,28 +1195,41 @@ class PluginManagerViewModel(
      * published versions (each tagged with IPC compatibility).
      */
     fun openVersions(pluginId: String, displayName: String, installedVersion: String?) {
-        _state.value = _state.value.copy(
-            versionSheet = VersionSheetState(
-                pluginId = pluginId,
-                displayName = displayName,
-                installedVersion = installedVersion
+        _state.update {
+            it.copy(
+                versionSheet = VersionSheetState(
+                    pluginId = pluginId,
+                    displayName = displayName,
+                    installedVersion = installedVersion,
+                ),
             )
-        )
+        }
         scope.launch {
             val result = api.fetchPluginVersions(pluginId)
-            val sheet = _state.value.versionSheet ?: return@launch
-            if (sheet.pluginId != pluginId) return@launch // sheet changed while loading
-            _state.value = _state.value.copy(
-                versionSheet = result.fold(
-                    onSuccess = { sheet.copy(isLoading = false, versions = it) },
-                    onFailure = { sheet.copy(isLoading = false, error = it.message ?: "Failed to load versions") }
+            // The staleness guard lives INSIDE the block. Reading versionSheet first and writing
+            // in a separate CAS left a check-then-act window: a closeVersions() landing between
+            // the two put the dismissed sheet back on screen, and a second openVersions for
+            // another plugin put it back pointing at the wrong one.
+            _state.update { s ->
+                val sheet = s.versionSheet
+                if (sheet?.pluginId != pluginId) return@update s
+                s.copy(
+                    versionSheet = result.fold(
+                        onSuccess = { sheet.copy(isLoading = false, versions = it) },
+                        onFailure = {
+                            sheet.copy(
+                                isLoading = false,
+                                error = it.message ?: "Failed to load versions",
+                            )
+                        },
+                    ),
                 )
-            )
+            }
         }
     }
 
     fun closeVersions() {
-        _state.value = _state.value.copy(versionSheet = null)
+        _state.update { it.copy(versionSheet = null) }
     }
 
     /**
@@ -1117,19 +1238,27 @@ class PluginManagerViewModel(
      */
     fun installVersion(pluginId: String, version: String) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
             val result = api.installVersion(pluginId, version)
-            val base = _state.value.copy(busyPlugins = _state.value.busyPlugins - pluginId)
-            _state.value = when (result) {
-                is InstallResult.Success -> base.copy(
-                    versionSheet = null,
-                    // Version changes of system/locked plugins land on disk only;
-                    // hot-reload (or prompt) so the chosen version actually runs.
-                    postUpdatePrompt = buildPostUpdatePrompt(listOf(pluginId))
-                )
-                // Covers VersionConflict too, which used to fall into an `else` and say nothing:
-                // the version sheet is the one surface where a conflict is most likely.
-                else -> base.copy(error = outcomeErrorFor(result, PluginAction.INSTALL))
+            // Hoisted out of the update block below: buildPostUpdatePrompt suspends and has
+            // side effects, and an update block can run more than once when the CAS retries.
+            // Version changes of system/locked plugins land on disk only; hot-reload (or
+            // prompt) so the chosen version actually runs.
+            val prompt =
+                if (result is InstallResult.Success) buildPostUpdatePrompt(listOf(pluginId))
+                else null
+            _state.update {
+                val base = it.copy(busyPlugins = it.busyPlugins - pluginId)
+                when (result) {
+                    is InstallResult.Success -> base.copy(
+                        versionSheet = null,
+                        postUpdatePrompt = prompt
+                    )
+                    // Covers VersionConflict too, which used to fall into an `else` and say
+                    // nothing: the version sheet is the one surface where a conflict is most
+                    // likely.
+                    else -> base.copy(error = outcomeErrorFor(result, PluginAction.INSTALL))
+                }
             }
         }
     }
@@ -1139,7 +1268,7 @@ class PluginManagerViewModel(
      */
     fun updateAllPlugins() {
         scope.launch {
-            _state.value = _state.value.copy(isLoading = true, error = null)
+            _state.update { it.copy(isLoading = true, error = null) }
 
             val updates = _state.value.updates.toList()
             // Display name to reason, so the banner can say why and not only which. One list
@@ -1160,14 +1289,20 @@ class PluginManagerViewModel(
                 }
             }
 
-            _state.value = _state.value.copy(
-                isLoading = false,
-                error = updateAllError(failed),
-                // Clearing this outright named a plugin in the banner and took its Update button
-                // away in the same breath, leaving no action for the one thing it had reported.
-                updates = remainingUpdates(_state.value.updates, succeeded.toSet()),
-                postUpdatePrompt = buildPostUpdatePrompt(succeeded)
-            )
+            // Hoisted out of the update block: buildPostUpdatePrompt RELOADS plugins, and an
+            // update block re-runs whenever the CAS loses a race - which would reload them twice.
+            val prompt = buildPostUpdatePrompt(succeeded)
+            _state.update {
+                it.copy(
+                    isLoading = false,
+                    error = updateAllError(failed),
+                    // Clearing this outright named a plugin in the banner and took its Update
+                    // button away in the same breath, leaving no action for the one thing it
+                    // had reported.
+                    updates = remainingUpdates(it.updates, succeeded.toSet()),
+                    postUpdatePrompt = prompt,
+                )
+            }
         }
     }
 
@@ -1223,7 +1358,7 @@ class PluginManagerViewModel(
     /** Confirm the post-update prompt: reset the affected plugins' running instances. */
     fun confirmResetInstances() {
         val prompt = _state.value.postUpdatePrompt ?: return
-        _state.value = _state.value.copy(postUpdatePrompt = null)
+        _state.update { it.copy(postUpdatePrompt = null) }
         scope.launch {
             // Toolbox last: resetting it disposes this plugin and cancels this coroutine, so any
             // id after it would never be reset. See `selfLast`.
@@ -1237,14 +1372,14 @@ class PluginManagerViewModel(
 
     /** Confirm the post-update prompt: restart the BOSS application. */
     fun confirmRestartApplication() {
-        _state.value = _state.value.copy(postUpdatePrompt = null)
+        _state.update { it.copy(postUpdatePrompt = null) }
         loaderDelegate?.restartApplication()
     }
 
     /** Confirm the post-update prompt: hot-swap the API layer (reloads every plugin). */
     fun confirmApiSwap() {
         val prompt = _state.value.postUpdatePrompt ?: return
-        _state.value = _state.value.copy(postUpdatePrompt = null)
+        _state.update { it.copy(postUpdatePrompt = null) }
         val jarPath = prompt.apiJarPath ?: return
         scope.launch {
             // Loading the newer api jar triggers the host's detached API-layer
@@ -1256,7 +1391,7 @@ class PluginManagerViewModel(
 
     /** Dismiss the post-update prompt without resetting/restarting. */
     fun dismissPostUpdatePrompt() {
-        _state.value = _state.value.copy(postUpdatePrompt = null)
+        _state.update { it.copy(postUpdatePrompt = null) }
     }
 
     /**
@@ -1264,7 +1399,7 @@ class PluginManagerViewModel(
      */
     fun togglePluginEnabled(pluginId: String, enabled: Boolean) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
 
             if (enabled) {
                 api.enablePlugin(pluginId)
@@ -1272,7 +1407,7 @@ class PluginManagerViewModel(
                 api.disablePlugin(pluginId)
             }
 
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins - pluginId)
+            _state.update { it.copy(busyPlugins = it.busyPlugins - pluginId) }
         }
     }
 
@@ -1344,28 +1479,32 @@ class PluginManagerViewModel(
      */
     fun deleteFromStore(pluginId: String) {
         scope.launch {
-            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins + pluginId, error = null)
+            _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
             val result = api.deleteFromStore(pluginId)
             result.fold(
                 onSuccess = {
                     val storeResult = api.fetchStorePlugins()
                     storeResult.fold(
                         onSuccess = { plugins ->
-                            _state.value = _state.value.copy(
-                                availablePlugins = plugins,
-                                busyPlugins = _state.value.busyPlugins - pluginId
-                            )
+                            _state.update {
+                                it.copy(
+                                    availablePlugins = plugins,
+                                    busyPlugins = it.busyPlugins - pluginId,
+                                )
+                            }
                         },
                         onFailure = {
-                            _state.value = _state.value.copy(busyPlugins = _state.value.busyPlugins - pluginId)
+                            _state.update { it.copy(busyPlugins = it.busyPlugins - pluginId) }
                         }
                     )
                 },
                 onFailure = { e ->
-                    _state.value = _state.value.copy(
-                        busyPlugins = _state.value.busyPlugins - pluginId,
-                        error = e.message ?: "Failed to delete plugin"
-                    )
+                    _state.update {
+                        it.copy(
+                            busyPlugins = it.busyPlugins - pluginId,
+                            error = e.message ?: "Failed to delete plugin",
+                        )
+                    }
                 }
             )
         }
@@ -1453,7 +1592,7 @@ class PluginManagerViewModel(
      * Clear error message.
      */
     fun clearError() {
-        _state.value = _state.value.copy(error = null)
+        _state.update { it.copy(error = null) }
     }
 
     /**

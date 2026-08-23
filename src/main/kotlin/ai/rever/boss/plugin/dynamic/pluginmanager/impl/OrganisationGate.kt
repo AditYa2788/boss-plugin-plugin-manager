@@ -8,68 +8,128 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
- * Which organisation call to action the Toolbox should offer, if any.
+ * The MEMBER route into the Organisation plugin, if this user has one.
  *
- * Pure, and separated from the view for that reason: the decision has four
- * outcomes over two unknowns, and two of those unknowns can each be "not yet
- * known" rather than a boolean. Getting that wrong is not a rendering bug, it
- * is a flash of "Create Organisation" shown to somebody who already has three
- * of them, every time the panel opens.
+ * One of the TWO axes this file decides. Requesting an organisation is the other
+ * ([orgRequestState]), and they are independent: a member may request a second organisation, and
+ * somebody with a request in the queue still belongs to whatever they already belong to.
+ *
+ * They used to be one four-outcome enum, and collapsing them was the bug. `ACTIVE` landed on
+ * OPEN / INSTALL_PLUGIN, which meant the request form did not exist for a member - and because
+ * the Create tab was revealed only for the two request branches, a member got no tab at all.
+ * Every user is seeded into `@risa`-sized organisations, so that was most of them.
  */
-enum class OrganisationCta {
-    /** No organisation yet: offer to request one. */
-    CREATE,
-
-    /**
-     * A request is in the queue.
-     *
-     * Rendered rather than collapsed into CREATE because without it, submitting a request changes
-     * nothing on screen at all - the same button with the same text - and the natural response is
-     * to submit again, which returns "already in use" and reads as a failure rather than a
-     * duplicate.
-     */
-    REQUEST_PENDING,
-
-    /** Has one, but the Organisation plugin is not installed: offer to install it. */
+enum class OrgAccess {
+    /** Belongs to one, but the Organisation plugin is not installed: offer to install it. */
     INSTALL_PLUGIN,
 
-    /** Has one and the plugin is installed: offer to open the panel. */
+    /** Belongs to one and the plugin is installed: offer to open the panel. */
     OPEN,
 }
 
 /**
- * Decide the call to action.
+ * Decide the member route, or null when there is none to offer.
  *
- * [membership] is null while the membership lookup is in flight, or when
- * there is no Supabase provider to ask. **Null renders nothing.** That is the
- * whole reason this is a nullable Boolean rather than a Boolean defaulting to
- * false: "we have not asked yet" and "you belong to none" are different states
- * that would otherwise both show CREATE, and the wrong one is shown to every
- * existing member for the duration of a round trip.
+ * Null for two different reasons, and neither is an error: they belong to no organisation, or the
+ * lookup has not answered yet. Both render no access button - the difference between them matters
+ * only to [orgRequestState], which is where it is expressed.
  *
- * [pluginInstalled] has no such ambiguity - the installed list is local and
- * known synchronously.
+ * [pluginInstalled] has no such ambiguity - the installed list is local and known synchronously.
  */
-fun organisationCta(
+fun orgAccessRoute(
     membership: Membership?,
     pluginInstalled: Boolean,
-    hasPendingRequest: Boolean = false,
-): OrganisationCta? =
+): OrgAccess? =
     when (membership) {
-        null -> null
-        Membership.ACTIVE ->
-            if (pluginInstalled) OrganisationCta.OPEN else OrganisationCta.INSTALL_PLUGIN
-        // Membership wins over a pending request: someone who has since been added to an
-        // organisation should be pointed at it, not at a request that is now moot.
-        Membership.NONE ->
-            if (hasPendingRequest) OrganisationCta.REQUEST_PENDING else OrganisationCta.CREATE
+        Membership.ACTIVE -> if (pluginInstalled) OrgAccess.OPEN else OrgAccess.INSTALL_PLUGIN
+        Membership.NONE, null -> null
+    }
+
+/**
+ * Whether requesting an organisation is on offer, and why not when it is not.
+ *
+ * The other axis. Four states rather than a Boolean because three different things all render as
+ * "no button" and the user is owed a different sentence for each: we have not asked yet, you
+ * already have one in the queue, and this host cannot ask at all.
+ *
+ * NOT gated on membership. That gate is what made this unreachable for anybody who already
+ * belonged to something, and there is nothing wrong with a member wanting a second organisation -
+ * a BOSS administrator reviews every request either way.
+ */
+enum class OrgRequest {
+    /** Offer the form. */
+    AVAILABLE,
+
+    /**
+     * One of the caller's own requests is already awaiting review.
+     *
+     * Rendered rather than collapsed into AVAILABLE because without it, submitting a request
+     * changes nothing on screen at all - the same button with the same text - and the natural
+     * response is to submit again, which returns "already in use" and reads as a failure rather
+     * than a duplicate.
+     */
+    PENDING,
+
+    /**
+     * The membership lookup has not answered yet.
+     *
+     * Shown as a disabled, neutral line rather than nothing. Rendering nothing was the old
+     * behaviour and it is what made the whole tab blank for a non-publisher whenever the read was
+     * slow or failed. The original concern - never flash the WRONG label at somebody who already
+     * has three organisations - is preserved by the label being neutral, not by the section being
+     * absent.
+     */
+    UNKNOWN,
+
+    /**
+     * No `supabaseDataProvider`, so there is nothing to ask and nothing to submit to.
+     *
+     * Distinct from UNKNOWN on purpose. They were indistinguishable before, and the difference is
+     * whether waiting helps: UNKNOWN resolves on the next refresh, UNAVAILABLE never does. Showing
+     * "Checking..." forever is worse than saying so.
+     */
+    UNAVAILABLE,
+}
+
+/**
+ * Decide whether the request form is on offer.
+ *
+ * [providerAvailable] is the host's `supabaseDataProvider`, not a network check: false means the
+ * plugin has no way to reach the RPC at all, which is a permanent condition for that host.
+ *
+ * A pending request wins over everything except an absent provider - it is the one state where
+ * acting again makes things worse.
+ */
+fun orgRequestState(
+    membership: Membership?,
+    hasPendingRequest: Boolean,
+    providerAvailable: Boolean,
+    readCompleted: Boolean,
+): OrgRequest =
+    when {
+        !providerAvailable -> OrgRequest.UNAVAILABLE
+        hasPendingRequest -> OrgRequest.PENDING
+        // Deliberately AFTER the pending check: a submitted request is known locally the moment it
+        // succeeds, and it should not revert to "Request an organisation" while the membership
+        // re-read is in flight.
+        //
+        // UNKNOWN only while a read is genuinely outstanding. A read that CAME BACK and told us
+        // nothing - transport failure, refusal envelope, malformed body - offers the request
+        // anyway. Being conservative there was right while requesting was gated on membership,
+        // because guessing wrong denied it; now that the two are decoupled a failed read affects
+        // only the WORDING, and orgRequestDescription has a membership-neutral variant for
+        // exactly this. Refusing to offer it instead leaves a permanent "Checking your
+        // organisations..." with no way forward, which is the failure this whole change is about.
+        // The server validates the submission regardless.
+        membership == null && !readCompleted -> OrgRequest.UNKNOWN
+        else -> OrgRequest.AVAILABLE
     }
 
 /**
  * What the server says about this user's organisations.
  *
- * Three states, not a Boolean, because a pending request is neither membership nor its absence:
- * treating it as absence hides the fact that a request was submitted at all.
+ * Two states plus null at the call sites, because "we have not asked yet" and "you belong to none"
+ * drive different sentences - see [OrgRequest.UNKNOWN].
  */
 enum class Membership {
     /** An active membership in at least one NON-system organisation. */
@@ -79,60 +139,94 @@ enum class Membership {
     NONE,
 }
 
-/** True when this call to action should be clickable. A pending request has nothing to do. */
-fun organisationCtaEnabled(cta: OrganisationCta): Boolean = cta != OrganisationCta.REQUEST_PENDING
+/**
+ * Should the Create tab be shown?
+ *
+ * A named function rather than an expression in the composable, because the PREVIOUS version of
+ * this expression was the bug and an inline one cannot be tested. It is deliberately NOT a
+ * function of membership - that gate is what made the request form unreachable for a member - and
+ * it is still a function of the service existing, because a tab whose only content is
+ * "Requesting is unavailable here" is an apology rather than a feature.
+ */
+fun createTabVisible(canPublish: Boolean, organisationServiceAvailable: Boolean): Boolean =
+    canPublish || organisationServiceAvailable
+
+/** True when the request control should be clickable. Only AVAILABLE has anything to do. */
+fun orgRequestEnabled(state: OrgRequest): Boolean = state == OrgRequest.AVAILABLE
 
 /**
- * Should the Create tab be revealed to a user who cannot publish, purely to carry this call to
- * action?
+ * Button label for the member route.
  *
- * Only for the two branches that have nowhere else to live. CREATE is the request form, which
- * exists in no other surface; REQUEST_PENDING is its follow-up state, and hiding it would put the
- * user back on a button that resubmits a request they already made.
- *
- * INSTALL_PLUGIN and OPEN are deliberately excluded: a member's route to the Organisation plugin
- * is the store and its own sidebar panel, so revealing an otherwise-empty Create tab for them
- * would show the tab to nearly everybody and buy nothing.
+ * Kept beside the decision rather than in the view so the two cannot drift, and so a test can
+ * assert the pairing. Each label names what will happen, not what the thing is: a control that
+ * says "Organisation" leaves the reader guessing.
  */
-fun organisationCtaNeedsCreateTab(cta: OrganisationCta?): Boolean =
-    cta == OrganisationCta.CREATE || cta == OrganisationCta.REQUEST_PENDING
-
-/**
- * Button label for a call to action.
- *
- * Kept beside the decision rather than in the view so the two cannot drift, and
- * so a test can assert the pairing. Each label names what will happen, not what
- * the thing is: a control that says "Organisation" leaves the reader guessing.
- */
-fun organisationCtaLabel(cta: OrganisationCta): String =
-    when (cta) {
-        OrganisationCta.CREATE -> "Request an organisation"
-        OrganisationCta.REQUEST_PENDING -> "Request pending review"
-        OrganisationCta.INSTALL_PLUGIN -> "Install the Organisation plugin"
-        OrganisationCta.OPEN -> "Open Organisation"
+fun orgAccessLabel(access: OrgAccess): String =
+    when (access) {
+        OrgAccess.INSTALL_PLUGIN -> "Install the Organisation plugin"
+        OrgAccess.OPEN -> "Open Organisation"
     }
 
-/** Explanatory line under the heading. */
-fun organisationCtaDescription(cta: OrganisationCta): String =
-    when (cta) {
-        OrganisationCta.CREATE ->
-            "You are not a member of any organisation. Requesting one opens a form; a BOSS " +
-                "administrator reviews it before the organisation is created."
+/** Label for the request control, in every state including the ones that cannot be clicked. */
+fun orgRequestLabel(state: OrgRequest): String =
+    when (state) {
+        OrgRequest.AVAILABLE -> "Request an organisation"
+        OrgRequest.PENDING -> "Request pending review"
+        OrgRequest.UNKNOWN -> "Checking your organisations..."
+        OrgRequest.UNAVAILABLE -> "Requesting is unavailable here"
+    }
 
-        OrganisationCta.REQUEST_PENDING ->
-            // Accurate now that this state comes from organisation_requests: those really are
+/** Explanatory line for the member route. */
+fun orgAccessDescription(access: OrgAccess): String =
+    when (access) {
+        OrgAccess.INSTALL_PLUGIN ->
+            "You belong to an organisation, but the Organisation plugin is not installed. " +
+                "Install it to manage members, roles and plugin visibility."
+
+        OrgAccess.OPEN ->
+            "Manage your organisation's members, roles, invite links and plugin visibility."
+    }
+
+/**
+ * Explanatory line for the request control.
+ *
+ * Takes [membership] rather than a derived Boolean, and three AVAILABLE variants rather than two.
+ * "You are not a member of any organisation" is plainly false for the member who can now also
+ * request one, and it is UNVERIFIED when the membership read failed - which is a state AVAILABLE
+ * is now reachable from. A sentence the reader can see is wrong costs more than the branch does.
+ */
+fun orgRequestDescription(state: OrgRequest, membership: Membership?): String =
+    when (state) {
+        OrgRequest.AVAILABLE ->
+            when (membership) {
+                Membership.ACTIVE ->
+                    "Need another organisation? Requesting one opens a form; a BOSS " +
+                        "administrator reviews it before the organisation is created."
+
+                Membership.NONE ->
+                    "You are not a member of any organisation. Requesting one opens a form; a " +
+                        "BOSS administrator reviews it before the organisation is created."
+
+                // Says nothing about what they belong to, because we could not find out.
+                null ->
+                    "Requesting an organisation opens a form; a BOSS administrator reviews it " +
+                        "before the organisation is created."
+            }
+
+        OrgRequest.PENDING ->
+            // Accurate because this state comes from organisation_requests: those really are
             // reviewed by a BOSS administrator holding organisation.approve. It was wrong while
             // the state came from a `pending` MEMBERSHIP, which is a request to join an existing
             // organisation and is approved by that organisation's own admin.
             "Your request to create an organisation is waiting for a BOSS administrator to " +
                 "review it. Nothing more to do here."
 
-        OrganisationCta.INSTALL_PLUGIN ->
-            "You belong to an organisation, but the Organisation plugin is not installed. " +
-                "Install it to manage members, roles and plugin visibility."
+        OrgRequest.UNKNOWN ->
+            "Looking up the organisations you belong to."
 
-        OrganisationCta.OPEN ->
-            "Manage your organisation's members, roles, invite links and plugin visibility."
+        OrgRequest.UNAVAILABLE ->
+            "This BOSS build cannot reach the organisation service, so a request cannot be " +
+                "submitted from here."
     }
 
 /** The store id of the Organisation plugin, and its panel id. */
@@ -145,20 +239,22 @@ object OrganisationPlugin {
  * Read this user's membership state out of a `get_my_organisations` response body.
  *
  * Returns null for anything that is not a confident answer - a transport failure, a refusal
- * envelope, malformed JSON. Null hides the call to action, which is the right failure: offering
- * "Request an organisation" because a read failed pushes somebody toward duplicating one they are
- * already in.
+ * envelope, malformed JSON. Null means UNKNOWN, never "belongs to none": the caller keeps the
+ * last known value rather than writing this over it, and what null changes is only the WORDING,
+ * never whether the request is offered. This paragraph used to argue the opposite - that a failed
+ * read must hide the offer - which was right while requesting was gated on membership and became
+ * wrong the moment the two were decoupled. See [orgRequestState].
  *
- * SYSTEM ORGANISATIONS ARE IGNORED, and this is the whole correctness of the CREATE branch.
+ * SYSTEM ORGANISATIONS ARE IGNORED, and this is the whole correctness of the not-a-member answer.
  * The seed makes every user an active member of the `boss` organisation and `handle_new_user`
  * keeps every future signup there, so `get_my_organisations` returns at least one active row for
- * literally everybody. Counting it made ACTIVE the only reachable answer and CREATE dead code in
- * production - the unit tests passed only because they fed `Membership.NONE` directly, which no
- * real response can produce.
+ * literally everybody. Counting it made ACTIVE the only reachable answer and `Membership.NONE`
+ * dead in production - the unit tests passed only because they fed it directly, which no real
+ * response can produce.
  *
  * Only an ACTIVE membership of a NON-system organisation counts. A `pending` or `invited` row is
  * about joining an existing organisation and is deliberately not membership here - see
- * [parsePendingRequest] for the state that actually drives REQUEST_PENDING.
+ * [parsePendingRequest] for the state that actually drives [OrgRequest.PENDING].
  */
 fun parseMembership(raw: String?): Membership? {
     if (raw.isNullOrBlank()) return null
@@ -187,8 +283,8 @@ fun parseMembership(raw: String?): Membership? {
  * A SEPARATE read, from `list_organisation_requests`, and it has to be:
  * `submit_organisation_request` writes to `organisation_requests` and creates no membership row
  * at all, while `get_my_organisations` reads `organisation_members`. Refreshing membership after a
- * submission therefore could never move the button off CREATE - the exact failure
- * REQUEST_PENDING was added to prevent.
+ * submission therefore could never move the button off "Request an organisation" - the exact
+ * failure [OrgRequest.PENDING] was added to prevent.
  *
  * REVIEWERS GET `null`, WHATEVER THE QUEUE HOLDS. The RPC scopes to the caller's own requests
  * only for a NON-reviewer; for a BOSS admin holding `organisation.approve` it returns the whole
