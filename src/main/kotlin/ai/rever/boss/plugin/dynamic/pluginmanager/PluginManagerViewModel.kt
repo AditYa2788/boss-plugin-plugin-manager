@@ -67,6 +67,15 @@ data class PluginManagerState(
     val isLoading: Boolean = false,
     /** Per-plugin loading state — tracks which plugins are currently being installed/updated/uninstalled. */
     val busyPlugins: Set<String> = emptySet(),
+    /**
+     * Plugins the HOST reports a transfer for, whoever started it.
+     *
+     * [busyPlugins] only knows what this panel did, so an update started from the
+     * update toast, from another window's Toolbox, or from the host's own
+     * "Update Available" prompt left this panel's button looking idle - and
+     * pressing it then raced the install already running.
+     */
+    val transferringPlugins: Set<String> = emptySet(),
     val searchQuery: String = "",
     /**
      * Organisation slug to narrow every tab to, or null for all of them.
@@ -146,6 +155,21 @@ data class PluginManagerState(
      */
     val openablePlugins: Set<String> = emptySet()
 ) {
+    /**
+     * Every plugin whose buttons should read as busy: what this panel started,
+     * plus what the host reports anyone else is transferring.
+     *
+     * One property rather than a union at each call site - there are five of them,
+     * and the one that was missed is exactly how a button comes to offer Install
+     * for something already installing.
+     *
+     * `by lazy`, not a `get()`: five call sites read it per recomposition, and a getter
+     * allocated a fresh set for each. One per state instance instead, which is what a
+     * data class recreated on every change wants. Not part of equals, which is correct -
+     * it is derived from two fields that are.
+     */
+    val activePlugins: Set<String> by lazy { busyPlugins + transferringPlugins }
+
     /**
      * The organisations to offer in the publish picker.
      *
@@ -294,6 +318,7 @@ class PluginManagerViewModel(
     private val apiImpl = core.apiImpl
     private val api: PluginManagerAPI = core.api
     private val loaderDelegate = core.loaderDelegate
+    private val transferReporter = core.reporter
 
     private val _state = MutableStateFlow(PluginManagerState())
     val state: StateFlow<PluginManagerState> = _state.asStateFlow()
@@ -327,6 +352,16 @@ class PluginManagerViewModel(
                 // happened to interleave the other way.
                 _state.update { it.copy(installedPlugins = installedStates) }
                 recomputeOpenablePlugins(installedStates)
+            }
+        }
+
+        // Every transfer the reporter knows about, so a button is busy for work this
+        // panel did not start. Host-wide where the host has a download center; this
+        // plugin's own work on a host that has not got one, which is the most it can
+        // know there.
+        scope.launch {
+            transferReporter.busyIds.collect { ids ->
+                _state.update { it.copy(transferringPlugins = ids) }
             }
         }
 
@@ -1040,9 +1075,9 @@ class PluginManagerViewModel(
         scope.launch {
             _state.update { it.copy(busyPlugins = it.busyPlugins + pluginId, error = null) }
 
-            // Friendly name for the status-bar progress item (the API only gets the id).
+            // Friendly name for the bottom-bar progress row (the API only gets the id).
             _state.value.availablePlugins.find { it.pluginId == pluginId }?.displayName
-                ?.let { apiImpl.downloadTracker.hintDisplayName(pluginId, it) }
+                ?.let { apiImpl.downloadNames.hint(pluginId, it) }
 
             val result = api.installPlugin(pluginId)
             when (result) {
@@ -1670,7 +1705,10 @@ internal fun failureReasonFor(
                 // not happen, which is the exact symptom this change exists to stop hiding.
                 PluginAction.UPDATE -> "version ${result.currentVersion} is still installed"
             }
-        is InstallResult.DownloadFailed -> result.error
+        // A cancel is an answer, not a fault: the user pressed Cancel in the download
+        // dialog. Answered here rather than at each button so the Update All banner
+        // does not count it as a failure either.
+        is InstallResult.DownloadFailed -> result.error.takeIf { it != DOWNLOAD_CANCELLED }
         is InstallResult.LoadFailed -> result.error
         // Not currently produced anywhere - nothing in PluginManagerAPIImpl constructs it, and
         // the IPC gate reports DownloadFailed instead. Handled because the sealed class allows

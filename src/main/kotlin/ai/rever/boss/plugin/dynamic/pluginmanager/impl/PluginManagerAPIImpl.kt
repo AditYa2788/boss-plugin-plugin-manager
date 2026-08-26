@@ -2,14 +2,18 @@ package ai.rever.boss.plugin.dynamic.pluginmanager.impl
 
 import ai.rever.boss.plugin.api.LoadedPluginInfo
 import ai.rever.boss.plugin.api.PluginLoaderDelegate
-import ai.rever.boss.plugin.dynamic.pluginmanager.DownloadKind
-import ai.rever.boss.plugin.dynamic.pluginmanager.DownloadProgressTracker
+import ai.rever.boss.plugin.dynamic.pluginmanager.DOWNLOAD_CANCELLED
+import ai.rever.boss.plugin.dynamic.pluginmanager.DownloadCancelledException
+import ai.rever.boss.plugin.dynamic.pluginmanager.wasCancelled
+import ai.rever.boss.plugin.dynamic.pluginmanager.DownloadDisplayNames
+import ai.rever.boss.plugin.dynamic.pluginmanager.TrackedDownloader
 import ai.rever.boss.plugin.dynamic.pluginmanager.UpdateSource
 import ai.rever.boss.plugin.dynamic.pluginmanager.updateSourceFor
 import ai.rever.boss.plugin.dynamic.pluginmanager.api.*
 import ai.rever.boss.plugin.dynamic.pluginmanager.realtime.PluginStoreRealtimeClient
 import ai.rever.boss.plugin.dynamic.pluginmanager.realtime.StoreChangeEvent
 import ai.rever.boss.plugin.dynamic.pluginmanager.realtime.withHostClassLoader
+import com.risaboss.toolbox.downloadcenter.TransferReporter
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
@@ -25,6 +29,7 @@ import kotlinx.serialization.json.contentOrNull
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Implementation of PluginManagerAPI.
@@ -46,7 +51,14 @@ import java.net.URL
  */
 class PluginManagerAPIImpl(
     private val scope: CoroutineScope,
-    private val loaderDelegate: PluginLoaderDelegate?
+    private val loaderDelegate: PluginLoaderDelegate?,
+    /**
+     * Where downloads are reported. The host's download center where there is one,
+     * this plugin's own status-bar tracker where there is not; either way this
+     * class only ever sees [TransferReporter], which names no api type - see
+     * `HostDownloadCenter` for why that matters on an older host.
+     */
+    private val reporter: TransferReporter
 ) : PluginManagerAPI {
 
     private val json = Json {
@@ -100,9 +112,6 @@ class PluginManagerAPIImpl(
     // Realtime client for live updates
     val realtimeClient = PluginStoreRealtimeClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     val storeChanges: SharedFlow<StoreChangeEvent> = realtimeClient.storeChanges
-
-    /** Live install/update download progress, surfaced in the host status bar. */
-    val downloadTracker = DownloadProgressTracker()
 
     fun connectRealtime() = realtimeClient.connect()
 
@@ -535,8 +544,8 @@ class PluginManagerAPIImpl(
 
     override suspend fun installVersion(pluginId: String, version: String): InstallResult = withContext(Dispatchers.IO) {
         val existing = getInstalledPlugin(pluginId)
-        val kind = if (existing != null) DownloadKind.UPDATE else DownloadKind.INSTALL
-        withDownloadTracking(pluginId, existing?.displayName ?: fallbackDisplayName(pluginId), kind) {
+        val isUpdate = existing != null
+        withDownloadTracking(pluginId, existing?.displayName ?: fallbackDisplayName(pluginId), isUpdate) {
             installVersionInternal(pluginId, version, existing, progressKey = pluginId)
         }
     }
@@ -694,69 +703,42 @@ class PluginManagerAPIImpl(
     // ========================================
 
     /**
-     * Track a download operation for [key] in [downloadTracker] while [block]
-     * runs. Nested operations on the same key reuse the outer entry (begin
-     * returns false), so a fallback path never shows a second status-bar item.
+     * Reporting, cancellation and the read loop, in one place that needs no store
+     * client - which is what makes them testable: constructing this class pulls in
+     * Supabase, and the download loop has nothing to do with it.
      */
+    private val downloads = TrackedDownloader(reporter)
+
+    /** Display names for transfers the API only receives an id for. */
+    val downloadNames: DownloadDisplayNames get() = downloads.displayNames
+
     private suspend fun <T> withDownloadTracking(
         key: String,
         displayName: String,
-        kind: DownloadKind,
+        isUpdate: Boolean,
         block: suspend () -> T
-    ): T {
-        val owned = downloadTracker.begin(key, displayName, kind)
-        try {
-            return block()
-        } finally {
-            if (owned) downloadTracker.end(key)
-        }
-    }
+    ): T = downloads.tracked(key, displayName, isUpdate, block)
+
+    /** Whether [result] is a transfer the user stopped, rather than one that failed. */
+    private fun isCancelled(result: InstallResult): Boolean = result.wasCancelled()
 
     /** Best-effort friendly name when only a pluginId is known. */
     private fun fallbackDisplayName(pluginId: String): String =
         getInstalledPlugin(pluginId)?.displayName ?: pluginId.substringAfterLast('.')
 
-    /**
-     * Stream [connection]'s body into [dest], reporting download progress to
-     * [downloadTracker] under [progressKey]. [expectedSize] (from the store's
-     * download info) is the fallback when the response lacks a Content-Length.
-     */
     private fun downloadWithProgress(
         connection: HttpURLConnection,
         dest: File,
         progressKey: String,
         expectedSize: Long = 0L
-    ) {
-        val total = connection.contentLengthLong.takeIf { it > 0 } ?: expectedSize
-        dest.outputStream().use { output ->
-            connection.inputStream.use { input ->
-                val buffer = ByteArray(64 * 1024)
-                var copied = 0L
-                var lastPercent = -1
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    output.write(buffer, 0, read)
-                    copied += read
-                    if (total > 0) {
-                        // Throttle state updates to whole-percent steps
-                        val percent = ((copied * 100) / total).toInt()
-                        if (percent != lastPercent) {
-                            lastPercent = percent
-                            downloadTracker.progress(progressKey, copied.toFloat() / total)
-                        }
-                    }
-                }
-            }
-        }
-    }
+    ) = downloads.download(connection, dest, progressKey, expectedSize)
 
     override suspend fun installPlugin(pluginId: String): InstallResult = withContext(Dispatchers.IO) {
         // Check if already installed
         getInstalledPlugin(pluginId)?.let {
             return@withContext InstallResult.AlreadyInstalled(it.version)
         }
-        withDownloadTracking(pluginId, fallbackDisplayName(pluginId), DownloadKind.INSTALL) {
+        withDownloadTracking(pluginId, fallbackDisplayName(pluginId), isUpdate = false) {
             installPluginInternal(pluginId, progressKey = pluginId)
         }
     }
@@ -770,7 +752,7 @@ class PluginManagerAPIImpl(
 
         // Try to download directly from plugin store first
         val downloadResult = downloadFromStore(pluginId, null, progressKey)
-        if (downloadResult is InstallResult.Success) {
+        if (downloadResult is InstallResult.Success || isCancelled(downloadResult)) {
             return downloadResult
         }
 
@@ -955,6 +937,9 @@ class PluginManagerAPIImpl(
             pluginsDir.listFiles { f ->
                 f.isFile && f.name.startsWith(pluginId.replace(".", "_")) && f.name.endsWith(".jar.part")
             }?.forEach { runCatching { it.delete() } }
+            // Unprefixed, so the buttons can tell a cancel from a failure. The cleanup
+            // above is exactly what a cancelled download needs too.
+            if (e is DownloadCancelledException) return InstallResult.DownloadFailed(DOWNLOAD_CANCELLED)
             return InstallResult.DownloadFailed("Store download error: ${e.message}")
         }
     }
@@ -1078,7 +1063,7 @@ class PluginManagerAPIImpl(
     override suspend fun installFromGitHub(githubUrl: String): InstallResult = withContext(Dispatchers.IO) {
         val repoName = Regex("""github\.com/[^/]+/([^/]+)""").find(githubUrl)
             ?.groupValues?.get(1)?.removeSuffix(".git")
-        withDownloadTracking(githubUrl, repoName ?: "plugin", DownloadKind.INSTALL) {
+        withDownloadTracking(githubUrl, repoName ?: "plugin", isUpdate = false) {
             installFromGitHubInternal(githubUrl, progressKey = githubUrl)
         }
     }
@@ -1205,6 +1190,11 @@ class PluginManagerAPIImpl(
             return InstallResult.Success(pluginInfo)
 
         } catch (e: Exception) {
+            // Explicit rather than relying on e.message happening to BE the constant:
+            // it does, because DownloadCancelledException carries it, but a future
+            // "Download failed: ${'$'}{e.message}" prefix here would silently turn a
+            // cancel back into an error the buttons report.
+            if (e is DownloadCancelledException) return InstallResult.DownloadFailed(DOWNLOAD_CANCELLED)
             return InstallResult.DownloadFailed(e.message ?: "Unknown error")
         }
     }
@@ -1298,7 +1288,7 @@ class PluginManagerAPIImpl(
     override suspend fun updatePlugin(pluginId: String): InstallResult = withContext(Dispatchers.IO) {
         val existing = getInstalledPlugin(pluginId)
             ?: return@withContext InstallResult.DownloadFailed("Plugin not installed: $pluginId")
-        withDownloadTracking(pluginId, existing.displayName, DownloadKind.UPDATE) {
+        withDownloadTracking(pluginId, existing.displayName, isUpdate = true) {
             updatePluginInternal(pluginId, existing, progressKey = pluginId)
         }
     }
@@ -1342,7 +1332,9 @@ class PluginManagerAPIImpl(
             is UpdateSource.Github -> installFromGitHubInternal(source.url, progressKey)
             is UpdateSource.Store -> {
                 val store = downloadFromStore(pluginId, null, progressKey)
-                if (store is InstallResult.Success || source.fallbackUrl == null) {
+                // A cancel is not a source that failed: falling through would open a
+                // second connection to fetch the same jar the user just stopped.
+                if (store is InstallResult.Success || isCancelled(store) || source.fallbackUrl == null) {
                     store
                 } else {
                     installFromGitHubInternal(source.fallbackUrl, progressKey)
@@ -1459,6 +1451,10 @@ class PluginManagerAPIImpl(
             // The caller supplies the verb, so naming it here produced "Update failed: Update
             // failed: <msg>". The other DownloadFailed sites in this file still self-prefix;
             // this one was the only outright duplication.
+            //
+            // The cancel is named explicitly rather than left to e.message happening to
+            // BE the constant - which it is, but only by coincidence.
+            if (e is DownloadCancelledException) return InstallResult.DownloadFailed(DOWNLOAD_CANCELLED)
             return InstallResult.DownloadFailed(e.message ?: "Unknown error")
         }
     }
@@ -1523,6 +1519,7 @@ class PluginManagerAPIImpl(
                 version = "latest"
             ))
         } catch (e: Exception) {
+            if (e is DownloadCancelledException) return InstallResult.DownloadFailed(DOWNLOAD_CANCELLED)
             return InstallResult.DownloadFailed("GitHub update failed: ${e.message}")
         }
     }
@@ -2082,16 +2079,32 @@ class PluginManagerAPIImpl(
     // HELPERS
     // ========================================
 
-    private fun isNewerVersion(newVersion: String, currentVersion: String): Boolean {
-        val newParts = newVersion.removePrefix("v").split(".").mapNotNull { it.toIntOrNull() }
-        val currentParts = currentVersion.removePrefix("v").split(".").mapNotNull { it.toIntOrNull() }
+    private fun isNewerVersion(newVersion: String, currentVersion: String): Boolean =
+        isVersionNewer(newVersion, currentVersion)
+}
 
-        for (i in 0 until maxOf(newParts.size, currentParts.size)) {
-            val newPart = newParts.getOrElse(i) { 0 }
-            val currentPart = currentParts.getOrElse(i) { 0 }
-            if (newPart > currentPart) return true
-            if (newPart < currentPart) return false
-        }
-        return false
+/**
+ * Whether [newVersion] is strictly newer than [currentVersion], comparing numeric
+ * parts and ignoring a leading `v`.
+ *
+ * Top-level rather than private because the update prompt asks the same question -
+ * "has this plugin reached at least the version the toast offered?" - and two
+ * copies of "newer" would eventually disagree. Non-numeric parts are dropped, so
+ * a prerelease suffix compares equal to its release; that is the behaviour the
+ * store's own update check has always had.
+ */
+internal fun isVersionNewer(
+    newVersion: String,
+    currentVersion: String
+): Boolean {
+    val newParts = newVersion.removePrefix("v").split(".").mapNotNull { it.toIntOrNull() }
+    val currentParts = currentVersion.removePrefix("v").split(".").mapNotNull { it.toIntOrNull() }
+
+    for (i in 0 until maxOf(newParts.size, currentParts.size)) {
+        val newPart = newParts.getOrElse(i) { 0 }
+        val currentPart = currentParts.getOrElse(i) { 0 }
+        if (newPart > currentPart) return true
+        if (newPart < currentPart) return false
     }
+    return false
 }

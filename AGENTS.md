@@ -8,13 +8,58 @@ Toolbox - self-contained plugin store with install, uninstall, and update capabi
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.pluginmanager`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.pluginmanager.PluginManagerDynamicPlugin`
-- **API Version**: 1.0.73 — `apiVersion` and `minApiVersion` in plugin.json, which is the
-  authority; this line had drifted to 1.0.57 and is now reconciled with it. Verified rather
-  than assumed: `PluginContext.panelRegistry` / `.tabRegistry` (read to resolve "open this
-  plugin" to a real panel or tab) are abstract members of `PluginContext`, and
-  `SupabaseDataProvider` / `PluginContext.supabaseDataProvider` (read by the organisation
-  call to action) go back to the 1.0.36 jar — so a host meeting the declared floor provides
-  all of them.
+- **API Version**: built against 1.0.85, but `minApiVersion` is **1.0.73** and
+  `minBossVersion` **9.4.2** - deliberately, so one build runs on every host. `plugin.json`
+  is the authority; keep this line reconciled with it (it had drifted to 1.0.57 once, and
+  then sat at 1.0.73).
+
+## Reporting downloads on a host that may not have a download center
+
+Progress used to be a status-bar widget this plugin owned, which is why a download the
+**host** started showed nothing. api 1.0.85 added `DownloadCenterProvider`, and this plugin
+reports into it - but it must also load on hosts that predate it, so the adoption is shaped
+by two host mechanisms rather than by taste:
+
+- **`BinaryCompatibilityValidator` rejects the WHOLE plugin** if any class under
+  `ai.rever.boss.plugin.*` in the jar names an api class or member the host cannot resolve.
+  Not degrade - refuse. It skips classes outside that package, which is what makes an
+  optional adapter possible at all.
+- **`PluginContext` is host-compiled and served parent-first**, so on an older host
+  `downloadCenterProvider` does not exist and reading it raises `NoSuchMethodError`. A `?:`
+  cannot help; a `catch (LinkageError)` can.
+
+So every reference to `DownloadCenterProvider`, `TransferHandle`, `TransferKind`,
+`TransferPhase` and `TransferInfo` lives in **`com.risaboss.toolbox.downloadcenter`**, outside
+the contract package, and everything in `ai.rever.boss.plugin.dynamic.pluginmanager` talks to
+`TransferReporter`, which names no api type. Two implementations sit behind it: the host
+center, and `LocalTransferReporter` feeding `DownloadStatusBarItem` - the bar older hosts
+already had, with no dialog and no Cancel, because there is no host surface for them.
+
+**Three rules if you touch this:**
+
+1. Never name a 1.0.85 type from `ai.rever.boss.plugin.*`. **`./gradlew verifyNoApiLeak`
+   enforces this**: it scans the constant pool of every contract class in the built jar, so it
+   catches references the compiler synthesised, which a source grep misses. Verified by
+   introducing a leak and watching it fail.
+
+   It is wired into `check` **and named explicitly in `test.yml`**, because nothing in CI runs
+   `check` - the workflow runs `test` and `buildPluginJar`, both narrower. Wiring it only into
+   `check` left it green locally and never executed on a pull request. If you add a guard here,
+   check which task CI actually invokes rather than which lifecycle task it hangs off.
+2. The call into `HostDownloadCenter` is guarded at **both** ends. The inner catch covers the
+   property read; the outer `runCatching` in `PluginManagerCore` covers resolving and
+   verifying the method itself, whose descriptor names the api types - that error is thrown at
+   the call site, where a catch inside the method can never see it.
+3. Register `DownloadStatusBarItem` only when `HostDownloadCenter` returned null. Two bars for
+   one download is the alternative.
+
+**`apiVersion` in plugin.json is compared, and the fallback survives it only by convention.**
+`DynamicPluginLoader.isApiVersionCompatible` checks the manifest's `apiVersion` against the api
+jar's frozen `PluginManifestConstants.CURRENT_API_VERSION` (`1.0.18` - a manifest SCHEMA version,
+not an api release), and it parses only (major, minor): `1.0.85` and `1.0.18` are both `(1, 0)`, so
+the patch component is ignored and the check passes on every host. Declaring `apiVersion: 1.1.x`
+would be refused everywhere - so if the api ever moves off `1.0.x`, this plugin's `apiVersion` line
+cannot follow it without giving up the older hosts this whole arrangement exists for.
 
 ## Essential Commands
 
