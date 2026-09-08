@@ -1564,7 +1564,12 @@ fun PluginManagerView(viewModel: PluginManagerViewModel) {
                         busyPlugins = state.activePlugins,
                         ownBusyPlugins = state.busyPlugins,
                         provenanceByPluginId = provenanceByPluginId,
-                        blockedUpdates = state.blockedUpdates
+                        blockedUpdates = state.blockedUpdates,
+                        isCheckingUpdates = state.isCheckingUpdates,
+                        updatesError = state.updatesError,
+                        lastCheckedEpochMs = state.updatesLastChecked,
+                        realtimeConnected = state.realtimeConnected,
+                        onRefresh = { viewModel.refreshUpdates() }
                     )
                     PluginManagerTab.MCP -> McpToolsTab(viewModel)
                     PluginManagerTab.PUBLISH -> PublishTab(
@@ -2819,6 +2824,66 @@ private fun AvailablePluginCard(
     }
 }
 
+/**
+ * The Updates-tab status strip: a manual Refresh control, plus a line that tells the three states
+ * this issue was about apart — checking, "couldn't check" (an error), and "last checked at HH:mm"
+ * (a success). Without it an empty list read the same whether the check succeeded, failed, or never
+ * ran since a version was published.
+ */
+@Composable
+private fun UpdatesTabHeader(
+    isChecking: Boolean,
+    error: String?,
+    lastCheckedEpochMs: Long?,
+    realtimeConnected: Boolean,
+    onRefresh: () -> Unit,
+) {
+    val statusText = when {
+        error != null -> error
+        isChecking -> "Checking for updates…"
+        lastCheckedEpochMs != null -> {
+            val at = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                .format(java.util.Date(lastCheckedEpochMs))
+            if (realtimeConnected) "Last checked $at · Live" else "Last checked $at"
+        }
+        realtimeConnected -> "Live"
+        else -> ""
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = statusText,
+            color = if (error != null) BossThemeColors.ErrorColor else BossThemeColors.TextSecondary,
+            fontSize = 11.sp,
+            fontWeight = if (error != null) FontWeight.Medium else FontWeight.Normal
+        )
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .clickable(enabled = !isChecking) { onRefresh() }
+                .padding(4.dp)
+        ) {
+            if (isChecking) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    color = BossThemeColors.AccentColor,
+                    strokeWidth = 2.dp
+                )
+            } else {
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = "Check for updates",
+                    tint = BossThemeColors.TextSecondary,
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun UpdatesTab(
     updates: List<UpdateInfo>,
@@ -2861,12 +2926,30 @@ private fun UpdatesTab(
      * to date" while updates they cannot have go unmentioned.
      */
     blockedUpdates: List<BlockedUpdateNotice> = emptyList(),
+    /** True while a check is in flight — drives the header's spinner and disables Refresh. */
+    isCheckingUpdates: Boolean = false,
+    /** The last check's failure message, or null when the last check succeeded. */
+    updatesError: String? = null,
+    /** Epoch millis of the last successful check, for the "last checked" line. */
+    lastCheckedEpochMs: Long? = null,
+    /** Whether the realtime store socket is live, so auto-refresh status can be shown. */
+    realtimeConnected: Boolean = false,
+    /** Manual re-check, from the header's Refresh control. */
+    onRefresh: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
     ) {
+        UpdatesTabHeader(
+            isChecking = isCheckingUpdates,
+            error = updatesError,
+            lastCheckedEpochMs = lastCheckedEpochMs,
+            realtimeConnected = realtimeConnected,
+            onRefresh = onRefresh
+        )
+        Spacer(Modifier.height(12.dp))
         if (blockedUpdates.isNotEmpty()) {
             BlockedUpdatesNotice(blockedUpdates)
             Spacer(Modifier.height(12.dp))

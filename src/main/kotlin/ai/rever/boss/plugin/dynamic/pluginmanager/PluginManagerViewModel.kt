@@ -5,6 +5,8 @@ import ai.rever.boss.plugin.api.CustomPluginEvent
 import ai.rever.boss.plugin.api.InaccessiblePluginInfo
 import ai.rever.boss.plugin.api.McpServerController
 import ai.rever.boss.plugin.api.SupabaseDataProvider
+import ai.rever.boss.plugin.logging.BossLogger
+import ai.rever.boss.plugin.logging.LogCategory
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.OrgAccess
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.canPublishAnywhereWith
 import ai.rever.boss.plugin.dynamic.pluginmanager.impl.orgPublishTargets
@@ -160,7 +162,17 @@ data class PluginManagerState(
      * same question with one membership check, and so a plugin registering or unregistering
      * its panel moves the button in both places at once.
      */
-    val openablePlugins: Set<String> = emptySet()
+    val openablePlugins: Set<String> = emptySet(),
+    /** True while an update check is in flight, for the Updates-tab refresh affordance. */
+    val isCheckingUpdates: Boolean = false,
+    /**
+     * The last update check that FAILED, as a user-facing string, or null when the last check
+     * succeeded. This is the field that ends the silence this issue was about: it lets the Updates
+     * tab tell "couldn't check" apart from "up to date", which an empty [updates] list cannot.
+     */
+    val updatesError: String? = null,
+    /** Epoch millis of the last SUCCESSFUL update check, or null if none has completed yet. */
+    val updatesLastChecked: Long? = null
 ) {
     /**
      * Every plugin whose buttons should read as busy: what this panel started,
@@ -300,6 +312,8 @@ class PluginManagerViewModel(
      * "Checking your organisations..." forever.
      */
     val organisationServiceAvailable: Boolean = supabaseDataProvider != null
+
+    private val logger = BossLogger.forComponent("PluginManager")
 
     /**
      * Which organisation read is the current one.
@@ -464,10 +478,24 @@ class PluginManagerViewModel(
      */
     fun selectTab(tab: PluginManagerTab) {
         _state.update { it.copy(currentTab = tab) }
-        // Auto-refresh store when switching to Available tab
-        if (tab == PluginManagerTab.AVAILABLE) {
-            refreshStore()
+        // Auto-refresh whichever tab shows data that can go stale while the panel sits open.
+        // The Updates tab needs this as much as the store: its list is only pushed on panel open
+        // and on realtime VersionAdded, so a panel opened before a version was published - with the
+        // realtime socket down - would otherwise never re-check from the tab the user is looking at.
+        when (tab) {
+            PluginManagerTab.AVAILABLE -> refreshStore()
+            PluginManagerTab.UPDATES -> refreshUpdates()
+            else -> Unit
         }
+    }
+
+    /**
+     * Re-check for updates, driving the Updates-tab checking indicator. The manual counterpart to
+     * the automatic checks on panel open and on realtime `VersionAdded`; both selecting the Updates
+     * tab and its Refresh control call this.
+     */
+    fun refreshUpdates() {
+        scope.launch { checkForUpdatesInternal() }
     }
 
     /**
@@ -595,8 +623,16 @@ class PluginManagerViewModel(
      * and a background check should not pay for a rescan.
      */
     private suspend fun checkForUpdatesInternal() {
+        _state.update { it.copy(isCheckingUpdates = true) }
         try {
-            val candidates = apiImpl.checkForUpdatesResult().getOrElse { return }
+            val candidates = apiImpl.checkForUpdatesResult().getOrElse { e ->
+                // A failed check must not read as "up to date". Log it and surface it on the
+                // Updates tab; the cached `updates` list is left untouched on purpose (see the
+                // KDoc above) so a failure never wipes out a good list.
+                logger.warn(LogCategory.NETWORK, "Update check failed", error = e)
+                _state.update { it.copy(updatesError = e.message ?: "Couldn't check for updates") }
+                return
+            }
             val updateInfos = candidates.loadable.map { (pluginId, newVersion) ->
                 val installed = _state.value.installedPlugins.find { it.pluginId == pluginId }
                 UpdateInfo(
@@ -618,11 +654,22 @@ class PluginManagerViewModel(
                     requiredBossVersion = held.requiredBossVersion
                 )
             }
-            _state.update { it.copy(updates = updateInfos, blockedUpdates = blocked) }
+            _state.update {
+                it.copy(
+                    updates = updateInfos,
+                    blockedUpdates = blocked,
+                    updatesError = null,
+                    updatesLastChecked = System.currentTimeMillis()
+                )
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // Silently fail update check
+            // Was "// Silently fail update check": the silence is the bug. Log it and surface it.
+            logger.warn(LogCategory.NETWORK, "Update check failed", error = e)
+            _state.update { it.copy(updatesError = e.message ?: "Couldn't check for updates") }
+        } finally {
+            _state.update { it.copy(isCheckingUpdates = false) }
         }
     }
 
