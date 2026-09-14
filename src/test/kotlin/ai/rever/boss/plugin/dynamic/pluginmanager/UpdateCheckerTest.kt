@@ -8,7 +8,7 @@ import kotlin.test.*
 
 class UpdateCheckerTest {
     @Test
-    fun `failure keeps cached updates and timestamp then retry clears error`() = runBlocking {
+    fun `failure keeps cached updates and timestamp then retry clears error`() = runBlocking<Unit> {
         val state = MutableStateFlow(PluginManagerState())
         var response = Result.success(UpdateCandidates(mapOf("plugin" to "2"), listOf(BlockedUpdate("held", "3", "9.9"))))
         var timestamp = 10L
@@ -37,7 +37,7 @@ class UpdateCheckerTest {
     }
 
     @Test
-    fun `overlapping refresh waits for prior check and keeps checking until completion`() = runBlocking {
+    fun `overlapping refresh waits for prior check and keeps checking until completion`() = runBlocking<Unit> {
         val state = MutableStateFlow(PluginManagerState(updatesError = "previous failure"))
         val first = CompletableDeferred<Unit>()
         val second = CompletableDeferred<Unit>()
@@ -64,7 +64,7 @@ class UpdateCheckerTest {
     }
 
     @Test
-    fun `cancellation is propagated without a failure and releases lock`() = runBlocking {
+    fun `cancellation is propagated without a failure and releases lock`() = runBlocking<Unit> {
         val state = MutableStateFlow(PluginManagerState())
         var cancel = true
         val checker = UpdateChecker(state, {
@@ -80,7 +80,7 @@ class UpdateCheckerTest {
     }
 
     @Test
-    fun `thrown fetch exception is surfaced and finishes checking`() = runBlocking {
+    fun `thrown fetch exception is surfaced and finishes checking`() = runBlocking<Unit> {
         val state = MutableStateFlow(PluginManagerState())
         val checker = UpdateChecker(state, { throw IllegalStateException("offline") }, {})
         checker.check()
