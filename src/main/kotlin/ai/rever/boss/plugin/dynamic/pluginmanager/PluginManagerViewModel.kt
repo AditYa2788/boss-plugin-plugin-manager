@@ -166,9 +166,8 @@ data class PluginManagerState(
     /** True while an update check is in flight, for the Updates-tab refresh affordance. */
     val isCheckingUpdates: Boolean = false,
     /**
-     * The last update check that FAILED, as a user-facing string, or null when the last check
-     * succeeded. This is the field that ends the silence this issue was about: it lets the Updates
-     * tab tell "couldn't check" apart from "up to date", which an empty [updates] list cannot.
+     * The last failed check as a user-facing string, cleared when a new check starts.
+     * Lets the Updates tab tell "couldn't check" apart from "up to date", which an empty [updates] list cannot.
      */
     val updatesError: String? = null,
     /** Epoch millis of the last SUCCESSFUL update check, or null if none has completed yet. */
@@ -343,6 +342,11 @@ class PluginManagerViewModel(
 
     private val _state = MutableStateFlow(PluginManagerState())
     val state: StateFlow<PluginManagerState> = _state.asStateFlow()
+    private val updateChecker = UpdateChecker(
+        state = _state,
+        fetch = { apiImpl.checkForUpdatesResult() },
+        reportFailure = { logger.warn(LogCategory.NETWORK, "Update check failed", error = it) },
+    )
 
     /** Held in a field so [dispose] can detach it — the registries outlive this panel. */
     private val registryListener: () -> Unit = { recomputeOpenablePlugins() }
@@ -622,56 +626,7 @@ class PluginManagerViewModel(
      * on purpose: installs and uninstalls all go through this plugin, so the cache is authoritative,
      * and a background check should not pay for a rescan.
      */
-    private suspend fun checkForUpdatesInternal() {
-        _state.update { it.copy(isCheckingUpdates = true) }
-        try {
-            val candidates = apiImpl.checkForUpdatesResult().getOrElse { e ->
-                // A failed check must not read as "up to date". Log it and surface it on the
-                // Updates tab; the cached `updates` list is left untouched on purpose (see the
-                // KDoc above) so a failure never wipes out a good list.
-                logger.warn(LogCategory.NETWORK, "Update check failed", error = e)
-                _state.update { it.copy(updatesError = e.message ?: "Couldn't check for updates") }
-                return
-            }
-            val updateInfos = candidates.loadable.map { (pluginId, newVersion) ->
-                val installed = _state.value.installedPlugins.find { it.pluginId == pluginId }
-                UpdateInfo(
-                    pluginId = pluginId,
-                    displayName = installed?.displayName ?: pluginId,
-                    currentVersion = installed?.version ?: "",
-                    newVersion = newVersion
-                )
-            }
-            // The held-back ones travel with them. Filtering them out and saying nothing would
-            // leave a user on an out-of-date host reading "All plugins are up to date" while
-            // updates they cannot have go unmentioned - a different silence, not a fix for the one
-            // this replaced.
-            val blocked = candidates.blockedByHost.map { held ->
-                val installed = _state.value.installedPlugins.find { it.pluginId == held.pluginId }
-                BlockedUpdateNotice(
-                    displayName = installed?.displayName ?: held.pluginId,
-                    newVersion = held.version,
-                    requiredBossVersion = held.requiredBossVersion
-                )
-            }
-            _state.update {
-                it.copy(
-                    updates = updateInfos,
-                    blockedUpdates = blocked,
-                    updatesError = null,
-                    updatesLastChecked = System.currentTimeMillis()
-                )
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Was "// Silently fail update check": the silence is the bug. Log it and surface it.
-            logger.warn(LogCategory.NETWORK, "Update check failed", error = e)
-            _state.update { it.copy(updatesError = e.message ?: "Couldn't check for updates") }
-        } finally {
-            _state.update { it.copy(isCheckingUpdates = false) }
-        }
-    }
+    private suspend fun checkForUpdatesInternal() = updateChecker.check()
 
     /**
      * Install a plugin from the store.

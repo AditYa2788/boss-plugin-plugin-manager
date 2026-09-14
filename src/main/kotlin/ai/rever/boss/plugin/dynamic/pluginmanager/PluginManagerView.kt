@@ -2856,6 +2856,7 @@ private fun UpdatesTabHeader(
     ) {
         Text(
             text = statusText,
+            modifier = Modifier.weight(1f),
             color = if (error != null) BossThemeColors.ErrorColor else BossThemeColors.TextSecondary,
             fontSize = 11.sp,
             fontWeight = if (error != null) FontWeight.Medium else FontWeight.Normal
@@ -2928,7 +2929,7 @@ private fun UpdatesTab(
     blockedUpdates: List<BlockedUpdateNotice> = emptyList(),
     /** True while a check is in flight — drives the header's spinner and disables Refresh. */
     isCheckingUpdates: Boolean = false,
-    /** The last check's failure message, or null when the last check succeeded. */
+    /** The last check's failure message, cleared when a new check starts. */
     updatesError: String? = null,
     /** Epoch millis of the last successful check, for the "last checked" line. */
     lastCheckedEpochMs: Long? = null,
@@ -2955,6 +2956,9 @@ private fun UpdatesTab(
             Spacer(Modifier.height(12.dp))
         }
         if (updates.isEmpty()) {
+            val emptyState = updatesEmptyState(
+                isCheckingUpdates, updatesError, lastCheckedEpochMs, blockedUpdates.isNotEmpty(),
+            )
             Box(
                 // Not fillMaxSize when a notice is above it: the empty state would push the notice
                 // off the top of a short panel, hiding the one thing that explains the emptiness.
@@ -2963,16 +2967,8 @@ private fun UpdatesTab(
             ) {
                 BossEmptyState(
                     icon = Icons.Default.Check,
-                    message = if (blockedUpdates.isEmpty()) {
-                        "All plugins are up to date"
-                    } else {
-                        "No updates you can install yet"
-                    },
-                    description = if (blockedUpdates.isEmpty()) {
-                        "No updates available"
-                    } else {
-                        "The updates above need a newer BOSS"
-                    }
+                    message = emptyState.message,
+                    description = emptyState.description
                 )
             }
         } else {
